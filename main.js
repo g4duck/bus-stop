@@ -16,21 +16,49 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
 const fetchStopList = async () => {
   const cachedStops = sessionStorage.getItem('kmbStops');
   if (cachedStops) return JSON.parse(cachedStops);
+
   try {
     const response = await fetch('https://data.etabus.gov.hk/v1/transport/kmb/stop');
     if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
     const data = await response.json();
-    const StopsData = data.data.map(({ stop, name_en, lat, long }) => ({
+    const stopsData = data.data.map(({ stop, name_en, lat, long }) => ({
       stop,
       name_en,
       lat: parseFloat(lat),
       long: parseFloat(long),
+      routes: [], // Initialize empty routes, filled later
     }));
-    sessionStorage.setItem('kmbStops', JSON.stringify(StopsData));
-    return StopsData;
+    sessionStorage.setItem('kmbStops', JSON.stringify(stopsData));
+    return stopsData;
   } catch (error) {
     console.error('Error fetching Stop List:', error);
     throw error;
+  }
+};
+
+// Fetch Route-Stop mappings and cache them
+const fetchRouteStops = async () => {
+  const cachedRouteStops = sessionStorage.getItem('kmbRouteStops');
+  if (cachedRouteStops) return JSON.parse(cachedRouteStops);
+
+  try {
+    const response = await fetch('https://data.etabus.gov.hk/v1/transport/kmb/route-stop');
+    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+    const data = await response.json();
+    const stopRoutes = {};
+    data.data.forEach(({ route, stop }) => {
+      if (!stopRoutes[stop]) stopRoutes[stop] = new Set();
+      stopRoutes[stop].add(route);
+    });
+    // Convert Sets to sorted arrays
+    for (const stop in stopRoutes) {
+      stopRoutes[stop] = [...stopRoutes[stop]].sort();
+    }
+    sessionStorage.setItem('kmbRouteStops', JSON.stringify(stopRoutes));
+    return stopRoutes;
+  } catch (error) {
+    console.error('Error fetching Route-Stop mappings:', error);
+    return {};
   }
 };
 
@@ -83,7 +111,7 @@ const getMidpoint = (lat1, lon1, lat2, lon2) => {
   return [(lat1 + lat2) / 2, (lon1 + lon2) / 2];
 };
 
-// Different zoom levels based on radius
+// Different zoom levels based on radius (adjusted for OpenLayers)
 const getZoomLevel = (radius) => {
   if (radius <= 100) return 18;
   if (radius <= 300) return 17;
@@ -117,9 +145,9 @@ const initMap = (userLat, userLon, radius) => {
   });
   userFeature.setStyle(
     new ol.style.Style({
-      image: new ol.style.Icon({
+      image: new ol.style.Icon({ //user location marker
         src: 'map-marker.ico',
-        scale: 0.7,
+        scale: 0.8,
         anchor: [0.5, 1],
       }),
     })
@@ -131,6 +159,20 @@ const initMap = (userLat, userLon, radius) => {
     }),
   });
   map.addLayer(vectorLayer);
+
+  // User location popup
+  const popupElement = document.createElement('div');
+  popupElement.className = 'popup';
+  popupElement.innerHTML = 'Your Location';
+
+  const popup = new ol.Overlay({
+    element: popupElement,
+    position: ol.proj.fromLonLat([userLon, userLat]),
+    positioning: 'bottom-center',
+    offset: [0, -30],
+    autoPan: false,
+  });
+  map.addOverlay(popup);
 };
 
 // Update map with selected stop
@@ -155,20 +197,20 @@ const updateMap = (userLat, userLon, stopLat, stopLon, radius) => {
     }),
   });
 
-  const userFeature = new ol.Feature({
+  const userFeature = new ol.Feature({ //user location
     geometry: new ol.geom.Point(ol.proj.fromLonLat([userLon, userLat])),
   });
   userFeature.setStyle(
     new ol.style.Style({
       image: new ol.style.Icon({
         src: 'map-marker.ico',
-        scale: 0.7,
+        scale: 0.8,
         anchor: [0.5, 1],
       }),
     })
   );
 
-  const stopFeature = new ol.Feature({
+  const stopFeature = new ol.Feature({ //stop location
     geometry: new ol.geom.Point(ol.proj.fromLonLat([stopLon, stopLat])),
   });
   stopFeature.setStyle(
@@ -187,6 +229,20 @@ const updateMap = (userLat, userLon, stopLat, stopLon, radius) => {
     }),
   });
   map.addLayer(vectorLayer);
+
+  // User location popup
+  const popupElement = document.createElement('div');
+  popupElement.className = 'popup';
+  popupElement.innerHTML = 'Your Location';
+
+  const popup = new ol.Overlay({
+    element: popupElement,
+    position: ol.proj.fromLonLat([userLon, userLat]),
+    positioning: 'bottom-center',
+    offset: [0, -30],
+    autoPan: false,
+  });
+  map.addOverlay(popup);
 };
 
 // Display nearby stops and handle ETA
@@ -195,6 +251,7 @@ const updateNearbyStops = async (userLat, userLon, radius) => {
   const container = document.querySelector('.container');
   const mapElement = document.getElementById('map');
 
+  // Reset map position to container
   if (mapElement.parentNode !== container) {
     container.appendChild(mapElement);
   }
@@ -202,11 +259,16 @@ const updateNearbyStops = async (userLat, userLon, radius) => {
   outputDiv.innerHTML = 'Loading stops...';
 
   try {
-    const stops = await fetchStopList();
+    const [stops, stopRoutes] = await Promise.all([
+      fetchStopList(),
+      fetchRouteStops(),
+    ]);
+
     const stopsWithDistance = stops
       .map((stop) => ({
         ...stop,
         distance: calculateDistance(userLat, userLon, stop.lat, stop.long),
+        routes: stopRoutes[stop.stop] || [], // Assign routes from mapping
       }))
       .filter((stop) => stop.distance <= radius)
       .sort((a, b) => a.distance - b.distance);
@@ -219,9 +281,10 @@ const updateNearbyStops = async (userLat, userLon, radius) => {
         const li = document.createElement('li');
         const stopInfo = document.createElement('div');
         stopInfo.classList.add('stop-info');
+        const routesText = stop.routes.length > 0 ? stop.routes.join(', ') : 'No routes';
         stopInfo.innerHTML = `
           <span class="distance">Distance: ${Math.round(stop.distance)}m</span>
-          <span class="stop">Stop: <a href="#" class="stop-link">${stop.name_en}</a></span>
+          <span class="stop">Stop: <a href="#" class="stop-link">${stop.name_en}</a> <span class="routes">(${routesText})</span></span>
         `;
         li.appendChild(stopInfo);
 
@@ -259,7 +322,7 @@ const updateNearbyStops = async (userLat, userLon, radius) => {
           if (window.innerWidth <= 500) {
             setTimeout(() => {
               mapElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }, 100); 
+            }, 100);
           }
         });
         ul.appendChild(li);
